@@ -1,0 +1,15 @@
+/* styles for privacy, terms and 404 pages */
+.page{padding:140px 0 90px;min-height:80vh}
+.page .wrap{width:min(760px,100% - 40px)}
+.page h1{font-size:clamp(2rem,5vw,3.1rem);line-height:1.1;margin-bottom:12px}
+.page .updated{color:var(--haze);margin-bottom:40px}
+.prose h2{font-size:1.2rem;max-width:none;margin:38px 0 12px}
+.prose p,.prose li{color:#cfc9e4;margin-bottom:14px;max-width:68ch}
+.prose ul{padding-left:22px;margin-bottom:14px}
+.prose a{color:var(--orchid);text-decoration:underline;text-underline-offset:3px}
+.notfound{min-height:100vh;display:grid;place-items:center;text-align:center;padding:40px 20px;position:relative;overflow:hidden;isolation:isolate}
+.notfound:before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(50% 50% at 50% 45%,rgba(124,58,237,.4),transparent 70%)}
+.notfound .box{display:grid;justify-items:center;gap:20px}
+.notfound h1{font-size:clamp(5.5rem,24vw,12rem);line-height:1;font-weight:700}
+.notfound h2{max-width:20ch}
+.notfound img{width:84px;height:84px;border-radius:22px;box-shadow:0 0 60px rgba(168,85,247,.6)}
