@@ -3,6 +3,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use('/api/ai', require('./ai-routes'));
 app.use(express.static(__dirname, { extensions: ['html'] }));
 app.get('/health', (req, res) => res.send('ok'));
 app.use((req, res) => res.status(404).sendFile(path.join(__dirname, 'index.html')));
