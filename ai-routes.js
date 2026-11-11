@@ -12,6 +12,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 
 const STAB = process.env.STABILITY_API_KEY;
 const GEMINI = process.env.GEMINI_API_KEY;
 const MODEL = process.env.CLIPORA_MODEL || 'gemini-2.5-flash';
+const ANTH = process.env.GEMINI_API_KEY;
 
 // ---------------------------------------------------------------- limits (in memory, reset on restart)
 const mins = {}, days = {};
