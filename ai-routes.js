@@ -1,53 +1,154 @@
-// Clipora AI routes. In your Render Express app:
-//   npm i multer
-//   const ai = require('./ai-routes'); app.use('/api/ai', ai);
-// Set env var STABILITY_API_KEY on Render. Needs Node 18+.
+// Clipora AI server routes. Mount with:  app.use('/api/ai', require('./ai-routes'));
+// Needs: npm i multer  |  Node 18+
+// Environment variables on Render:
+//   ANTHROPIC_API_KEY  -> chat, voice-to-text answers, storyboards (Clipora AI brain)
+//   STABILITY_API_KEY  -> pictures: generate, remove background, erase, expand, upscale, edit
+//   CLIPORA_MODEL      -> optional, defaults to claude-sonnet-5-5
 const express = require('express');
 const multer = require('multer');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024 } });
-const KEY = process.env.STABILITY_API_KEY;
-const hits = {};
+const STAB = process.env.STABILITY_API_KEY;
+const ANTH = process.env.ANTHROPIC_API_KEY;
+const MODEL = process.env.CLIPORA_MODEL || 'claude-sonnet-5-5';
 
-router.use((req, res, next) => {
-  const k = (req.headers['x-clipora-uid'] || req.ip) + '';
-  const now = Date.now();
-  hits[k] = (hits[k] || []).filter(t => now - t < 60000);
-  if (hits[k].length >= 8) return res.status(429).json({ error: 'Too many AI requests, wait a minute' });
-  hits[k].push(now);
-  next();
-});
+// ---------------------------------------------------------------- limits (in memory, reset on restart)
+const mins = {}, days = {};
+const DAY = { chat: 80, image: 25, picture: 40, storyboard: 12 };
+function who(req) { return (req.headers['x-clipora-uid'] || 'anon') + '|' + req.ip; }
+function limit(kind) {
+  return (req, res, next) => {
+    const k = who(req), now = Date.now(), today = new Date().toISOString().slice(0, 10);
+    const m = (mins[k] = (mins[k] || []).filter(t => now - t < 60000));
+    if (m.length >= 30) return res.status(429).json({ error: 'Too many requests, wait a minute' });
+    m.push(now);
+    const d = (days[k + kind] = days[k + kind] && days[k + kind].day === today ? days[k + kind] : { day: today, n: 0 });
+    if (d.n >= DAY[kind]) return res.status(429).json({ error: 'Daily limit reached for this feature. Try again tomorrow.' });
+    d.n++;
+    next();
+  };
+}
+router.get('/health', (req, res) => res.json({ ok: true, pictures: !!STAB, chat: !!ANTH, model: MODEL }));
 
-router.get('/health', (req, res) => res.json({ ok: true, keySet: !!KEY }));
-
+// ---------------------------------------------------------------- pictures (Stability)
 async function stability(path, fields, files) {
-  if (!KEY) throw new Error('STABILITY_API_KEY is not set on the server');
+  if (!STAB) throw new Error('STABILITY_API_KEY is not set on the server');
   const form = new FormData();
   for (const k in fields) if (fields[k] !== undefined && fields[k] !== '') form.append(k, String(fields[k]));
   for (const k in files) form.append(k, new Blob([files[k].buffer], { type: files[k].mimetype }), files[k].originalname);
   const r = await fetch('https://api.stability.ai/v2beta/stable-image/' + path, {
-    method: 'POST', headers: { authorization: 'Bearer ' + KEY, accept: 'image/*' }, body: form });
+    method: 'POST', headers: { authorization: 'Bearer ' + STAB, accept: 'image/*' }, body: form });
   if (!r.ok) throw new Error((await r.text()).slice(0, 300));
   return Buffer.from(await r.arrayBuffer());
 }
 const send = (res, buf) => { res.set('Content-Type', 'image/png'); res.send(buf); };
 const wrap = fn => async (req, res) => { try { await fn(req, res); } catch (e) { res.status(500).json({ error: e.message }); } };
 
-router.post('/removebg', upload.single('image'), wrap(async (req, res) =>
+router.post('/removebg', limit('picture'), upload.single('image'), wrap(async (req, res) =>
   send(res, await stability('edit/remove-background', { output_format: 'png' }, { image: req.file }))));
-
-router.post('/erase', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'mask', maxCount: 1 }]), wrap(async (req, res) =>
+router.post('/erase', limit('picture'), upload.fields([{ name: 'image', maxCount: 1 }, { name: 'mask', maxCount: 1 }]), wrap(async (req, res) =>
   send(res, await stability('edit/erase', { output_format: 'png' }, { image: req.files.image[0], mask: req.files.mask[0] }))));
-
-router.post('/expand', upload.single('image'), wrap(async (req, res) =>
+router.post('/expand', limit('picture'), upload.single('image'), wrap(async (req, res) =>
   send(res, await stability('edit/outpaint', { left: req.body.left, right: req.body.right, up: req.body.up,
     down: req.body.down, prompt: req.body.prompt, output_format: 'png' }, { image: req.file }))));
-
-router.post('/upscale', upload.single('image'), wrap(async (req, res) =>
+router.post('/upscale', limit('picture'), upload.single('image'), wrap(async (req, res) =>
   send(res, await stability('upscale/fast', { output_format: 'png' }, { image: req.file }))));
+router.post('/edit', limit('picture'), upload.single('image'), wrap(async (req, res) =>
+  send(res, await stability('control/structure', { prompt: req.body.prompt, control_strength: 0.7, output_format: 'png' }, { image: req.file }))));
 
-router.post('/edit', upload.single('image'), wrap(async (req, res) =>
-  send(res, await stability('control/structure', { prompt: req.body.prompt, control_strength: 0.7,
-    output_format: 'png' }, { image: req.file }))));
+const RATIOS = ['1:1', '9:16', '16:9', '4:5', '5:4', '3:2', '2:3', '21:9', '9:21'];
+router.post('/imagine', limit('image'), upload.none(), wrap(async (req, res) => {
+  const ratio = RATIOS.includes(req.body.ratio) ? req.body.ratio : '1:1';
+  const prompt = String(req.body.prompt || '').slice(0, 1500);
+  if (!prompt.trim()) return res.status(400).json({ error: 'Describe the picture first' });
+  send(res, await stability('generate/core', { prompt, aspect_ratio: ratio, output_format: 'png' }, {}));
+}));
+
+// ---------------------------------------------------------------- Clipora AI brain (Anthropic)
+const SYSTEM = `You are Clipora AI, the built-in assistant of Clipora, a video and photo editing app made by Esar.App (developer: Ekeme Rejoice). Tagline: Edit. Create. Inspire.
+You are a brilliant, warm, honest all-round assistant. Help with anything: video and photo ideas, scripts, captions, hooks, hashtags, social media and content strategy, writing, translation, studying and homework, maths, coding, business and career advice, planning, everyday questions. Think carefully, give correct, practical answers, and say so when you are unsure. Never invent facts.
+Style: you are on a phone. Be clear and concise, match the user's language (English, French, Pidgin, etc.), use short paragraphs, and use simple Markdown only (**bold**, "- " bullets, numbered lists, \`code\`, fenced code blocks). Ask one short question only when you truly need it. Do not mention which AI model or company powers you; if asked, say you are Clipora AI built by Esar.App.
+You can see images and read PDFs the user attaches: describe, analyse and give edit advice for them.
+Clipora has these tools, which you may offer by adding action lines at the very END of your answer, each on its own line, only when genuinely useful:
+::image{prompt="detailed English picture prompt" ratio="1:1"}   (generate a picture; ratios: 1:1, 9:16, 16:9, 4:5)
+::open{tool="enhance"}   (open Edit photo with a tool: enhance, retouch, removebg, erase, expand, bg, crop, filters, adjust, text, canvas)
+::video{idea="short description"}   (turn an idea into an AI slideshow video the user can edit)
+Never explain these lines; the app turns them into buttons. If the user clearly asks you to make a picture, include ::image with a rich, specific prompt (subject, style, lighting, mood).`;
+
+function toBlocks(m) {
+  const blocks = [];
+  (m.images || []).slice(0, 4).forEach(i => blocks.push({ type: 'image', source: { type: 'base64', media_type: i.mime || 'image/jpeg', data: i.b64 } }));
+  (m.docs || []).slice(0, 2).forEach(d => blocks.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: d.b64 } }));
+  const t = String(m.text || '').slice(0, 12000);
+  blocks.push({ type: 'text', text: t.trim() ? t : '(attachment)' });
+  return blocks;
+}
+function clean(messages) {
+  const out = [];
+  (Array.isArray(messages) ? messages : []).slice(-24).forEach(m => {
+    if (m && (m.role === 'user' || m.role === 'assistant') && (m.text || (m.images && m.images.length) || (m.docs && m.docs.length))) {
+      out.push({ role: m.role, content: m.role === 'user' ? toBlocks(m) : String(m.text).slice(0, 12000) });
+    }
+  });
+  while (out.length && out[0].role !== 'user') out.shift();
+  return out;
+}
+
+router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req, res) => {
+  if (!ANTH) return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not set on the server' });
+  const messages = clean(req.body.messages);
+  if (!messages.length || messages[messages.length - 1].role !== 'user') return res.status(400).json({ error: 'No message' });
+  const ctl = new AbortController();
+  req.on('close', () => ctl.abort());
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', signal: ctl.signal,
+      headers: { 'x-api-key': ANTH, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: MODEL, max_tokens: 2048, stream: true, system: SYSTEM, messages })
+    });
+    if (!r.ok) return res.status(502).json({ error: 'AI error: ' + (await r.text()).slice(0, 200) });
+    res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders();
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line.startsWith('data:')) continue;
+        try {
+          const ev = JSON.parse(line.slice(5));
+          if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') res.write('data: ' + JSON.stringify({ d: ev.delta.text }) + '\n\n');
+          else if (ev.type === 'error') res.write('data: ' + JSON.stringify({ e: (ev.error && ev.error.message) || 'AI error' }) + '\n\n');
+        } catch (e) { /* ignore partial line */ }
+      }
+    }
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (e) {
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+    else { res.write('data: ' + JSON.stringify({ e: e.message }) + '\n\n'); res.end(); }
+  }
+});
+
+router.post('/storyboard', limit('storyboard'), express.json({ limit: '1mb' }), wrap(async (req, res) => {
+  if (!ANTH) throw new Error('ANTHROPIC_API_KEY is not set on the server');
+  const idea = String(req.body.idea || '').slice(0, 800);
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST', headers: { 'x-api-key': ANTH, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, max_tokens: 1500,
+      system: 'You plan short vertical videos made from AI pictures. Reply with ONLY valid JSON, no prose: {"title":"...","scenes":[{"imagePrompt":"rich English picture prompt, consistent style and characters across scenes","caption":"short on-screen text in the user language","seconds":3}]}. Use 4 to 6 scenes, 2 to 4 seconds each.',
+      messages: [{ role: 'user', content: idea }] }) });
+  if (!r.ok) throw new Error('AI error: ' + (await r.text()).slice(0, 200));
+  const j = await r.json();
+  const t = (j.content && j.content[0] && j.content[0].text) || '';
+  const a = t.indexOf('{'), b = t.lastIndexOf('}');
+  if (a < 0 || b < 0) throw new Error('Could not plan the video, try again');
+  res.json(JSON.parse(t.slice(a, b + 1)));
+}));
 
 module.exports = router;
