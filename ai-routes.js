@@ -216,4 +216,20 @@ router.get('/models', async (req, res) => {
     res.json({ status: r.status, models: (j.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name.replace('models/', '')), error: j.error });
   } catch (e) { res.json({ error: String(e) }); }
 });
+router.get('/modeltest', async (req, res) => {
+  const names = ['gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-2.5-flash-lite', 'gemini-3.5-flash', 'gemma-4-26b-a4b-it'];
+  const out = await Promise.all(names.map(async n => {
+    const t = Date.now();
+    try {
+      const r = await fetch(GBASE + n + ':generateContent', {
+        method: 'POST', signal: AbortSignal.timeout(40000),
+        headers: { 'x-goog-api-key': ANTH || '', 'content-type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Say hi in 3 words' }] }], generationConfig: { maxOutputTokens: 40 } })
+      });
+      const b = await r.text();
+      return { model: n, ms: Date.now() - t, status: r.status, body: b.slice(0, 160).replace(/\s+/g, ' ') };
+    } catch (e) { return { model: n, ms: Date.now() - t, error: String(e) }; }
+  }));
+  res.json({ configured: MODEL, results: out });
+});
 module.exports = router;
