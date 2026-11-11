@@ -1,16 +1,16 @@
 // Clipora AI server routes. Mount with:  app.use('/api/ai', require('./ai-routes'));
 // Needs: npm i multer  |  Node 18+
 // Environment variables on Render:
-//   ANTHROPIC_API_KEY  -> chat, voice-to-text answers, storyboards (Clipora AI brain)
+//   GEMINI_API_KEY     -> chat, voice-to-text answers, storyboards (Clipora AI brain)
 //   STABILITY_API_KEY  -> pictures: generate, remove background, erase, expand, upscale, edit
-//   CLIPORA_MODEL      -> optional, defaults to claude-sonnet-5-5
+//   CLIPORA_MODEL      -> optional, defaults to gemini-2.5-flash
 const express = require('express');
 const multer = require('multer');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024 } });
 const STAB = process.env.STABILITY_API_KEY;
-const ANTH = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.CLIPORA_MODEL || 'claude-sonnet-5-5';
+const GEMINI = process.env.GEMINI_API_KEY;
+const MODEL = process.env.CLIPORA_MODEL || 'gemini-2.5-flash';
 
 // ---------------------------------------------------------------- limits (in memory, reset on restart)
 const mins = {}, days = {};
@@ -28,7 +28,7 @@ function limit(kind) {
     next();
   };
 }
-router.get('/health', (req, res) => res.json({ ok: true, pictures: !!STAB, chat: !!ANTH, model: MODEL }));
+router.get('/health', (req, res) => res.json({ ok: true, pictures: !!STAB, chat: !!GEMINI, model: MODEL }));
 
 // ---------------------------------------------------------------- pictures (Stability)
 async function stability(path, fields, files) {
@@ -64,7 +64,7 @@ router.post('/imagine', limit('image'), upload.none(), wrap(async (req, res) => 
   send(res, await stability('generate/core', { prompt, aspect_ratio: ratio, output_format: 'png' }, {}));
 }));
 
-// ---------------------------------------------------------------- Clipora AI brain (Anthropic)
+// ---------------------------------------------------------------- Clipora AI brain (Gemini)
 const SYSTEM = `You are Clipora AI, the built-in assistant of Clipora, a video and photo editing app made by Esar.App (developer: Ekeme Rejoice). Tagline: Edit. Create. Inspire.
 You are a brilliant, warm, honest all-round assistant. Help with anything: video and photo ideas, scripts, captions, hooks, hashtags, social media and content strategy, writing, translation, studying and homework, maths, coding, business and career advice, planning, everyday questions. Think carefully, give correct, practical answers, and say so when you are unsure. Never invent facts.
 Style: you are on a phone. Be clear and concise, match the user's language (English, French, Pidgin, etc.), use short paragraphs, and use simple Markdown only (**bold**, "- " bullets, numbered lists, \`code\`, fenced code blocks). Ask one short question only when you truly need it. Do not mention which AI model or company powers you; if asked, say you are Clipora AI built by Esar.App.
@@ -75,19 +75,24 @@ Clipora has these tools, which you may offer by adding action lines at the very 
 ::video{idea="short description"}   (turn an idea into an AI slideshow video the user can edit)
 Never explain these lines; the app turns them into buttons. If the user clearly asks you to make a picture, include ::image with a rich, specific prompt (subject, style, lighting, mood).`;
 
-function toBlocks(m) {
-  const blocks = [];
-  (m.images || []).slice(0, 4).forEach(i => blocks.push({ type: 'image', source: { type: 'base64', media_type: i.mime || 'image/jpeg', data: i.b64 } }));
-  (m.docs || []).slice(0, 2).forEach(d => blocks.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: d.b64 } }));
+function toGeminiParts(m) {
+  const parts = [];
+  (m.images || []).slice(0, 4).forEach(i => {
+    if (i.b64) parts.push({ inlineData: { mimeType: i.mime || 'image/jpeg', data: i.b64 } });
+  });
+  (m.docs || []).slice(0, 2).forEach(d => {
+    if (d.b64) parts.push({ inlineData: { mimeType: 'application/pdf', data: d.b64 } });
+  });
   const t = String(m.text || '').slice(0, 12000);
-  blocks.push({ type: 'text', text: t.trim() ? t : '(attachment)' });
-  return blocks;
+  parts.push({ text: t.trim() ? t : '(attachment)' });
+  return parts;
 }
 function clean(messages) {
   const out = [];
   (Array.isArray(messages) ? messages : []).slice(-24).forEach(m => {
     if (m && (m.role === 'user' || m.role === 'assistant') && (m.text || (m.images && m.images.length) || (m.docs && m.docs.length))) {
-      out.push({ role: m.role, content: m.role === 'user' ? toBlocks(m) : String(m.text).slice(0, 12000) });
+      const role = m.role === 'assistant' ? 'model' : 'user';
+      out.push({ role, parts: m.role === 'user' ? toGeminiParts(m) : [{ text: String(m.text).slice(0, 12000) }] });
     }
   });
   while (out.length && out[0].role !== 'user') out.shift();
@@ -95,16 +100,21 @@ function clean(messages) {
 }
 
 router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req, res) => {
-  if (!ANTH) return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not set on the server' });
-  const messages = clean(req.body.messages);
-  if (!messages.length || messages[messages.length - 1].role !== 'user') return res.status(400).json({ error: 'No message' });
+  if (!GEMINI) return res.status(500).json({ error: 'GEMINI_API_KEY is not set on the server' });
+  const contents = clean(req.body.messages);
+  if (!contents.length || contents[contents.length - 1].role !== 'user') return res.status(400).json({ error: 'No message' });
   const ctl = new AbortController();
   req.on('close', () => ctl.abort());
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse&key=${GEMINI}`;
+    const r = await fetch(url, {
       method: 'POST', signal: ctl.signal,
-      headers: { 'x-api-key': ANTH, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: MODEL, max_tokens: 2048, stream: true, system: SYSTEM, messages })
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM }] },
+        contents,
+        generationConfig: { maxOutputTokens: 2048 }
+      })
     });
     if (!r.ok) return res.status(502).json({ error: 'AI error: ' + (await r.text()).slice(0, 200) });
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
@@ -122,8 +132,8 @@ router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req,
         if (!line.startsWith('data:')) continue;
         try {
           const ev = JSON.parse(line.slice(5));
-          if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') res.write('data: ' + JSON.stringify({ d: ev.delta.text }) + '\n\n');
-          else if (ev.type === 'error') res.write('data: ' + JSON.stringify({ e: (ev.error && ev.error.message) || 'AI error' }) + '\n\n');
+          const text = ev.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (text) res.write('data: ' + JSON.stringify({ d: text }) + '\n\n');
         } catch (e) { /* ignore partial line */ }
       }
     }
@@ -136,16 +146,21 @@ router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req,
 });
 
 router.post('/storyboard', limit('storyboard'), express.json({ limit: '1mb' }), wrap(async (req, res) => {
-  if (!ANTH) throw new Error('ANTHROPIC_API_KEY is not set on the server');
+  if (!GEMINI) throw new Error('GEMINI_API_KEY is not set on the server');
   const idea = String(req.body.idea || '').slice(0, 800);
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST', headers: { 'x-api-key': ANTH, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: MODEL, max_tokens: 1500,
-      system: 'You plan short vertical videos made from AI pictures. Reply with ONLY valid JSON, no prose: {"title":"...","scenes":[{"imagePrompt":"rich English picture prompt, consistent style and characters across scenes","caption":"short on-screen text in the user language","seconds":3}]}. Use 4 to 6 scenes, 2 to 4 seconds each.',
-      messages: [{ role: 'user', content: idea }] }) });
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI}`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: 'You plan short vertical videos made from AI pictures. Reply with ONLY valid JSON, no prose: {"title":"...","scenes":[{"imagePrompt":"rich English picture prompt, consistent style and characters across scenes","caption":"short on-screen text in the user language","seconds":3}]}. Use 4 to 6 scenes, 2 to 4 seconds each.' }] },
+      contents: [{ role: 'user', parts: [{ text: idea }] }],
+      generationConfig: { maxOutputTokens: 1500 }
+    })
+  });
   if (!r.ok) throw new Error('AI error: ' + (await r.text()).slice(0, 200));
   const j = await r.json();
-  const t = (j.content && j.content[0] && j.content[0].text) || '';
+  const t = j.candidates?.[0]?.content?.parts?.[0]?.text || '';
   const a = t.indexOf('{'), b = t.lastIndexOf('}');
   if (a < 0 || b < 0) throw new Error('Could not plan the video, try again');
   res.json(JSON.parse(t.slice(a, b + 1)));
