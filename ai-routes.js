@@ -209,4 +209,11 @@ router.get('/selftest2', async (req, res) => {
     res.json({ ms: Date.now() - t, status: r.status, body: (await r.text()).slice(0, 500) });
   } catch (e) { res.json({ ms: Date.now() - t, error: String(e), cause: String(e && e.cause) }); }
 });
+router.get('/models', async (req, res) => {
+  try {
+    const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100', { signal: AbortSignal.timeout(20000), headers: { 'x-goog-api-key': ANTH || '' } });
+    const j = await r.json();
+    res.json({ status: r.status, models: (j.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name.replace('models/', '')), error: j.error });
+  } catch (e) { res.json({ error: String(e) }); }
+});
 module.exports = router;
