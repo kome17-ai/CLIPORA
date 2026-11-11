@@ -99,24 +99,40 @@ function clean(messages) {
   return out;
 }
 
+
+const GBASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
+function gclean(messages) {
+  const out = [];
+  (Array.isArray(messages) ? messages : []).slice(-24).forEach(m => {
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) return;
+    const parts = [];
+    if (m.role === 'user') {
+      (m.images || []).slice(0, 4).forEach(i => parts.push({ inlineData: { mimeType: i.mime || 'image/jpeg', data: i.b64 } }));
+      (m.docs || []).slice(0, 2).forEach(d => parts.push({ inlineData: { mimeType: 'application/pdf', data: d.b64 } }));
+    }
+    const t = String(m.text || '').slice(0, 12000);
+    if (t.trim()) parts.push({ text: t });
+    else if (!parts.length) return;
+    else parts.push({ text: '(attachment)' });
+    out.push({ role: m.role === 'user' ? 'user' : 'model', parts });
+  });
+  while (out.length && out[0].role !== 'user') out.shift();
+  return out;
+}
+
 router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req, res) => {
-  if (!GEMINI) return res.status(500).json({ error: 'GEMINI_API_KEY is not set on the server' });
-  const contents = clean(req.body.messages);
+  if (!ANTH) return res.status(500).json({ error: 'GEMINI_API_KEY is not set on the server' });
+  const contents = gclean(req.body.messages);
   if (!contents.length || contents[contents.length - 1].role !== 'user') return res.status(400).json({ error: 'No message' });
   const ctl = new AbortController();
-  req.on('close', () => ctl.abort());
+  res.on('close', () => { if (!res.writableEnded) ctl.abort(); });
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse&key=${GEMINI}`;
-    const r = await fetch(url, {
+    const r = await fetch(GBASE + MODEL + ':streamGenerateContent?alt=sse', {
       method: 'POST', signal: ctl.signal,
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM }] },
-        contents,
-        generationConfig: { maxOutputTokens: 2048 }
-      })
+      headers: { 'x-goog-api-key': ANTH, 'content-type': 'application/json' },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents, generationConfig: { maxOutputTokens: 2048, temperature: 0.8 } })
     });
-    if (!r.ok) return res.status(502).json({ error: 'AI error: ' + (await r.text()).slice(0, 200) });
+    if (!r.ok) return res.status(502).json({ error: 'AI error: ' + (await r.text()).slice(0, 300) });
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.flushHeaders();
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -132,38 +148,40 @@ router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req,
         if (!line.startsWith('data:')) continue;
         try {
           const ev = JSON.parse(line.slice(5));
-          const text = ev.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (text) res.write('data: ' + JSON.stringify({ d: text }) + '\n\n');
-        } catch (e) { /* ignore partial line */ }
+          const c = ev.candidates && ev.candidates[0];
+          const ps = (c && c.content && c.content.parts) || [];
+          ps.forEach(p => { if (p.text && !p.thought) res.write('data: ' + JSON.stringify({ d: p.text }) + '\n\n'); });
+          if (c && c.finishReason === 'SAFETY') res.write('data: ' + JSON.stringify({ d: '\n\nI cannot help with that one.' }) + '\n\n');
+        } catch (e) { /* partial line */ }
       }
     }
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (e) {
+    if (res.writableEnded) return;
     if (!res.headersSent) res.status(500).json({ error: e.message });
     else { res.write('data: ' + JSON.stringify({ e: e.message }) + '\n\n'); res.end(); }
   }
 });
 
 router.post('/storyboard', limit('storyboard'), express.json({ limit: '1mb' }), wrap(async (req, res) => {
-  if (!GEMINI) throw new Error('GEMINI_API_KEY is not set on the server');
+  if (!ANTH) throw new Error('GEMINI_API_KEY is not set on the server');
   const idea = String(req.body.idea || '').slice(0, 800);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI}`;
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
+  const r = await fetch(GBASE + MODEL + ':generateContent', {
+    method: 'POST', headers: { 'x-goog-api-key': ANTH, 'content-type': 'application/json' },
     body: JSON.stringify({
-      systemInstruction: { parts: [{ text: 'You plan short vertical videos made from AI pictures. Reply with ONLY valid JSON, no prose: {"title":"...","scenes":[{"imagePrompt":"rich English picture prompt, consistent style and characters across scenes","caption":"short on-screen text in the user language","seconds":3}]}. Use 4 to 6 scenes, 2 to 4 seconds each.' }] },
+      systemInstruction: { parts: [{ text: 'You plan short vertical videos made from AI pictures. Reply with ONLY valid JSON: {"title":"...","scenes":[{"imagePrompt":"rich English picture prompt, consistent style and characters across scenes","caption":"short on-screen text in the user language","seconds":3}]}. Use 4 to 6 scenes, 2 to 4 seconds each.' }] },
       contents: [{ role: 'user', parts: [{ text: idea }] }],
-      generationConfig: { maxOutputTokens: 1500 }
+      generationConfig: { maxOutputTokens: 1500, responseMimeType: 'application/json' }
     })
   });
-  if (!r.ok) throw new Error('AI error: ' + (await r.text()).slice(0, 200));
+  if (!r.ok) throw new Error('AI error: ' + (await r.text()).slice(0, 300));
   const j = await r.json();
-  const t = j.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  const a = t.indexOf('{'), b = t.lastIndexOf('}');
+  const t = (((j.candidates || [])[0] || {}).content || {}).parts;
+  const txt = (t && t[0] && t[0].text) || '';
+  const a = txt.indexOf('{'), b = txt.lastIndexOf('}');
   if (a < 0 || b < 0) throw new Error('Could not plan the video, try again');
-  res.json(JSON.parse(t.slice(a, b + 1)));
+  res.json(JSON.parse(txt.slice(a, b + 1)));
 }));
 
 module.exports = router;
