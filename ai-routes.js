@@ -185,4 +185,15 @@ router.post('/storyboard', limit('storyboard'), express.json({ limit: '1mb' }), 
   res.json(JSON.parse(txt.slice(a, b + 1)));
 }));
 
+process.on('uncaughtException', e => console.error('CRASH', e));
+process.on('unhandledRejection', e => console.error('REJECT', e));
+router.get('/selftest', async (req, res) => {
+  try {
+    const r = await fetch(GBASE + MODEL + ':generateContent', {
+      method: 'POST', headers: { 'x-goog-api-key': ANTH || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Say hi in 3 words' }] }] })
+    });
+    res.json({ node: process.version, key: !!ANTH, model: MODEL, status: r.status, body: (await r.text()).slice(0, 600) });
+  } catch (e) { res.json({ node: process.version, key: !!ANTH, error: String(e && e.stack || e) }); }
+});
 module.exports = router;
