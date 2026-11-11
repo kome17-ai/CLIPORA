@@ -123,26 +123,69 @@ function gclean(messages) {
   return out;
 }
 
+async function needSearch(text) {
+  try {
+    const r = await fetch(GBASE + MODEL + ':generateContent', {
+      method: 'POST', signal: AbortSignal.timeout(9000),
+      headers: { 'x-goog-api-key': ANTH, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: 'Decide whether answering the user needs fresh or factual information from the web: news, current events, prices, weather, sports scores, recent releases, specific people, companies or places, local info, anything recent or that you are unsure about. Chit-chat, writing, coding, maths, translation, editing ideas and plain general knowledge need NO search. Reply ONLY with JSON: {"search":true or false,"query":"short web search query"}' }] },
+        contents: [{ role: 'user', parts: [{ text: text.slice(0, 600) }] }],
+        generationConfig: { maxOutputTokens: 200, temperature: 0, responseMimeType: 'application/json' }
+      })
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const t = (((j.candidates || [])[0] || {}).content || {}).parts;
+    const o = JSON.parse((t && t[0] && t[0].text) || '{}');
+    return o.search && o.query ? String(o.query).slice(0, 200) : null;
+  } catch (e) { return null; }
+}
+async function tavily(query) {
+  const r = await fetch('https://api.tavily.com/search', {
+    method: 'POST', signal: AbortSignal.timeout(14000),
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + process.env.TAVILY_API_KEY },
+    body: JSON.stringify({ query, search_depth: 'basic', max_results: 5, include_answer: false })
+  });
+  if (!r.ok) throw new Error('search ' + r.status);
+  const j = await r.json();
+  return (j.results || []).filter(x => x && x.url);
+}
+
 router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req, res) => {
   if (!ANTH) return res.status(500).json({ error: 'GEMINI_API_KEY is not set on the server' });
   const contents = gclean(req.body.messages);
   if (!contents.length || contents[contents.length - 1].role !== 'user') return res.status(400).json({ error: 'No message' });
   const ctl = new AbortController();
   res.on('close', () => { if (!res.writableEnded) ctl.abort(); });
-  const call = tools => fetch(GBASE + MODEL + ':streamGenerateContent?alt=sse', {
-    method: 'POST', signal: ctl.signal,
-    headers: { 'x-goog-api-key': ANTH, 'content-type': 'application/json' },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents, tools: tools ? [{ google_search: {} }] : undefined, generationConfig: { maxOutputTokens: 2048, temperature: 0.8 } })
-  });
+  let sources = [];
+  if (process.env.TAVILY_API_KEY && process.env.CLIPORA_SEARCH !== 'off') {
+    try {
+      const last = contents[contents.length - 1];
+      const userText = last.parts.filter(p => p.text).map(p => p.text).join(' ');
+      const q = userText.trim().length > 3 ? await needSearch(userText) : null;
+      if (q) {
+        const rs = await tavily(q);
+        if (rs.length) {
+          sources = rs.map(x => ({ t: String(x.title || 'Source').replace(/["{}\n]/g, ' ').slice(0, 60), u: x.url }));
+          last.parts.push({ text: '\n\n[Web search results for "' + q + '", today is ' + new Date().toISOString().slice(0, 10) + ']\n' +
+            rs.map((x, i) => '[' + (i + 1) + '] ' + x.title + ' (' + x.url + '): ' + String(x.content || '').slice(0, 500)).join('\n') +
+            '\n\nUse these results to answer. Summarize in your own words, state the key facts clearly, and say so if sources disagree. Do not paste long quotes.' });
+        }
+      }
+    } catch (e) { sources = []; }
+  }
   try {
-    let r = await call(process.env.CLIPORA_SEARCH !== 'off');
-    if (!r.ok && r.status >= 400 && r.status < 500) r = await call(false);
+    const r = await fetch(GBASE + MODEL + ':streamGenerateContent?alt=sse', {
+      method: 'POST', signal: ctl.signal,
+      headers: { 'x-goog-api-key': ANTH, 'content-type': 'application/json' },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents, generationConfig: { maxOutputTokens: 2048, temperature: 0.8 } })
+    });
     if (!r.ok) return res.status(502).json({ error: 'AI error: ' + (await r.text()).slice(0, 300) });
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.flushHeaders();
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = '';
-    const sources = [], seen = {};
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -157,11 +200,6 @@ router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req,
           const c = ev.candidates && ev.candidates[0];
           const ps = (c && c.content && c.content.parts) || [];
           ps.forEach(p => { if (p.text && !p.thought) res.write('data: ' + JSON.stringify({ d: p.text }) + '\n\n'); });
-          const gm = c && c.groundingMetadata;
-          ((gm && gm.groundingChunks) || []).forEach(g => {
-            const w = g && g.web;
-            if (w && w.uri && !seen[w.uri] && sources.length < 5) { seen[w.uri] = 1; sources.push({ t: String(w.title || 'Source').replace(/["{}\n]/g, ' ').slice(0, 60), u: w.uri }); }
-          });
         } catch (e) { /* partial line */ }
       }
     }
