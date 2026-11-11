@@ -240,4 +240,24 @@ router.get('/modeltest', async (req, res) => {
   }));
   res.json({ configured: MODEL, results: out });
 });
+router.get('/searchtest', async (req, res) => {
+  const combos = [];
+  [MODEL, 'gemini-3.5-flash', 'gemini-3.5-flash-lite'].forEach(m => ['google_search', 'googleSearch'].forEach(k => combos.push([m, k])));
+  const out = await Promise.all(combos.map(async ([m, k]) => {
+    const t = Date.now();
+    try {
+      const tool = {}; tool[k] = {};
+      const r = await fetch(GBASE + m + ':generateContent', {
+        method: 'POST', signal: AbortSignal.timeout(40000),
+        headers: { 'x-goog-api-key': ANTH || '', 'content-type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'What is the latest news in Cameroon today? Answer in 2 sentences.' }] }], tools: [tool], generationConfig: { maxOutputTokens: 1500 } })
+      });
+      const j = await r.json().catch(() => ({}));
+      const c = (j.candidates || [])[0] || {};
+      const txt = ((c.content || {}).parts || []).map(p => p.text || '').join('').slice(0, 120);
+      return { model: m, tool: k, ms: Date.now() - t, status: r.status, grounded: !!(c.groundingMetadata && c.groundingMetadata.groundingChunks), text: txt, error: j.error && j.error.message ? j.error.message.slice(0, 200) : undefined };
+    } catch (e) { return { model: m, tool: k, ms: Date.now() - t, error: String(e) }; }
+  }));
+  res.json({ configured: MODEL, search: process.env.CLIPORA_SEARCH || 'on', results: out });
+});
 module.exports = router;
