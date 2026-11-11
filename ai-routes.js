@@ -1,3 +1,4 @@
+require('dns').setDefaultResultOrder('ipv4first');
 // Clipora AI server routes. Mount with:  app.use('/api/ai', require('./ai-routes'));
 // Needs: npm i multer  |  Node 18+
 // Environment variables on Render:
@@ -195,5 +196,16 @@ router.get('/selftest', async (req, res) => {
     });
     res.json({ node: process.version, key: !!ANTH, model: MODEL, status: r.status, body: (await r.text()).slice(0, 600) });
   } catch (e) { res.json({ node: process.version, key: !!ANTH, error: String(e && e.stack || e) }); }
+});
+router.get('/selftest2', async (req, res) => {
+  const t = Date.now();
+  try {
+    const r = await fetch(GBASE + MODEL + ':generateContent', {
+      method: 'POST', signal: AbortSignal.timeout(20000),
+      headers: { 'x-goog-api-key': ANTH || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Say hi in 3 words' }] }] })
+    });
+    res.json({ ms: Date.now() - t, status: r.status, body: (await r.text()).slice(0, 500) });
+  } catch (e) { res.json({ ms: Date.now() - t, error: String(e), cause: String(e && e.cause) }); }
 });
 module.exports = router;
