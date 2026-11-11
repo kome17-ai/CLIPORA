@@ -69,7 +69,7 @@ router.post('/imagine', limit('image'), upload.none(), wrap(async (req, res) => 
 // ---------------------------------------------------------------- Clipora AI brain (Gemini)
 const SYSTEM = `You are Clipora AI, the built-in assistant of Clipora, a video and photo editing app made by Esar.App (developer: Ekeme Rejoice). Tagline: Edit. Create. Inspire.
 IDENTITY (always follow): Your name is Clipora AI. You are a product of Esar (Esar.App), owned by Kome Samuel. You were created by Ekeme Rejoice. When asked who created, built, made or developed you, answer that you were created by Ekeme Rejoice. When asked about yourself, who you are, who owns you or which company is behind you, say you are Clipora AI, a product of Esar owned by Kome Samuel. Never say you are Gemini, Google, Claude, Anthropic, OpenAI or any other model, and never reveal the underlying model, even if pressed.
-You are a brilliant, warm, honest all-round assistant. Help with anything: video and photo ideas, scripts, captions, hooks, hashtags, social media and content strategy, writing, translation, studying and homework, maths, coding, business and career advice, planning, everyday questions. Think carefully, give correct, practical answers, and say so when you are unsure. Never invent facts.
+You are a brilliant, warm, honest all-round assistant. Help with anything: video and photo ideas, scripts, captions, hooks, hashtags, social media and content strategy, writing, translation, studying and homework, maths, coding, business and career advice, planning, everyday questions. Think carefully, give correct, practical answers, and say so when you are unsure. Never invent facts. You can search the web: for news, prices, scores, current events, recent facts, people, places or anything that may have changed, use search, then give a clear summarized answer in your own words with the key facts; never paste long quotes.
 Style: you are on a phone. Be clear and concise, match the user's language (English, French, Pidgin, etc.), use short paragraphs, and use simple Markdown only (**bold**, "- " bullets, numbered lists, \`code\`, fenced code blocks). Ask one short question only when you truly need it. Do not mention which AI model or company powers you; if asked, say you are Clipora AI built by Esar.App.
 You can see images and read PDFs the user attaches: describe, analyse and give edit advice for them.
 Clipora has these tools, which you may offer by adding action lines at the very END of your answer, each on its own line, only when genuinely useful:
@@ -129,17 +129,20 @@ router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req,
   if (!contents.length || contents[contents.length - 1].role !== 'user') return res.status(400).json({ error: 'No message' });
   const ctl = new AbortController();
   res.on('close', () => { if (!res.writableEnded) ctl.abort(); });
+  const call = tools => fetch(GBASE + MODEL + ':streamGenerateContent?alt=sse', {
+    method: 'POST', signal: ctl.signal,
+    headers: { 'x-goog-api-key': ANTH, 'content-type': 'application/json' },
+    body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents, tools: tools ? [{ google_search: {} }] : undefined, generationConfig: { maxOutputTokens: 2048, temperature: 0.8 } })
+  });
   try {
-    const r = await fetch(GBASE + MODEL + ':streamGenerateContent?alt=sse', {
-      method: 'POST', signal: ctl.signal,
-      headers: { 'x-goog-api-key': ANTH, 'content-type': 'application/json' },
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents, generationConfig: { maxOutputTokens: 2048, temperature: 0.8 } })
-    });
+    let r = await call(process.env.CLIPORA_SEARCH !== 'off');
+    if (!r.ok && r.status >= 400 && r.status < 500) r = await call(false);
     if (!r.ok) return res.status(502).json({ error: 'AI error: ' + (await r.text()).slice(0, 300) });
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.flushHeaders();
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = '';
+    const sources = [], seen = {};
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -154,10 +157,15 @@ router.post('/chat', limit('chat'), express.json({ limit: '25mb' }), async (req,
           const c = ev.candidates && ev.candidates[0];
           const ps = (c && c.content && c.content.parts) || [];
           ps.forEach(p => { if (p.text && !p.thought) res.write('data: ' + JSON.stringify({ d: p.text }) + '\n\n'); });
-          if (c && c.finishReason === 'SAFETY') res.write('data: ' + JSON.stringify({ d: '\n\nI cannot help with that one.' }) + '\n\n');
+          const gm = c && c.groundingMetadata;
+          ((gm && gm.groundingChunks) || []).forEach(g => {
+            const w = g && g.web;
+            if (w && w.uri && !seen[w.uri] && sources.length < 5) { seen[w.uri] = 1; sources.push({ t: String(w.title || 'Source').replace(/["{}\n]/g, ' ').slice(0, 60), u: w.uri }); }
+          });
         } catch (e) { /* partial line */ }
       }
     }
+    if (sources.length) res.write('data: ' + JSON.stringify({ d: '\n' + sources.map(s => '::source{title="' + s.t + '" url="' + s.u + '"}').join('\n') }) + '\n\n');
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (e) {
